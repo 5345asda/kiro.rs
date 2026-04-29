@@ -5,7 +5,7 @@
 //! 支持多凭据故障转移和重试
 
 use reqwest::Client;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -22,7 +22,7 @@ use parking_lot::Mutex;
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
-const MAX_TOTAL_RETRIES: usize = 9;
+const MAX_TOTAL_RETRIES: usize = 30;
 
 /// Kiro API Provider
 ///
@@ -40,6 +40,11 @@ pub struct KiroProvider {
 }
 
 impl KiroProvider {
+    /// 创建新的 KiroProvider 实例
+    pub fn new(token_manager: Arc<MultiTokenManager>) -> Self {
+        Self::with_proxy(token_manager, None)
+    }
+
     /// 创建带代理配置的 KiroProvider 实例
     pub fn with_proxy(token_manager: Arc<MultiTokenManager>, proxy: Option<ProxyConfig>) -> Self {
         let tls_backend = token_manager.config().tls_backend;
@@ -67,6 +72,32 @@ impl KiroProvider {
         let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
         cache.insert(effective, client.clone());
         Ok(client)
+    }
+
+    /// 获取 token_manager 的引用
+    pub fn token_manager(&self) -> &MultiTokenManager {
+        &self.token_manager
+    }
+
+    /// 获取 API 基础 URL（使用 config 级 api_region）
+    pub fn base_url(&self) -> String {
+        format!(
+            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            self.token_manager.config().effective_api_region()
+        )
+    }
+
+    /// 获取 MCP API URL（使用 config 级 api_region）
+    pub fn mcp_url(&self) -> String {
+        format!(
+            "https://q.{}.amazonaws.com/mcp",
+            self.token_manager.config().effective_api_region()
+        )
+    }
+
+    /// 获取 API 基础域名（使用 config 级 api_region）
+    pub fn base_domain(&self) -> String {
+        format!("q.{}.amazonaws.com", self.token_manager.config().effective_api_region())
     }
 
     /// 获取凭据级 API 基础 URL
@@ -108,19 +139,6 @@ impl KiroProvider {
             .get("modelId")?
             .as_str()
             .map(|s| s.to_string())
-    }
-
-    /// 将凭据的 profile_arn 注入到请求体 JSON 中
-    fn inject_profile_arn(request_body: &str, profile_arn: &Option<String>) -> String {
-        if let Some(arn) = profile_arn {
-            if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
-                json["profileArn"] = serde_json::Value::String(arn.clone());
-                if let Ok(body) = serde_json::to_string(&json) {
-                    return body;
-                }
-            }
-        }
-        request_body.to_string()
     }
 
     /// 发送非流式 API 请求
@@ -173,9 +191,8 @@ impl KiroProvider {
     /// 内部方法：带重试逻辑的 MCP API 调用
     async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = Self::max_retry_count(total_credentials);
         let mut last_error: Option<anyhow::Error> = None;
-        let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
             // 获取调用上下文
@@ -254,8 +271,8 @@ impl KiroProvider {
             // 失败响应
             let body = response.text().await.unwrap_or_default();
 
-            // 402 额度用尽
-            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+            // 402 - 直接禁用并切换到下一个号
+            if status.as_u16() == 402 {
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -269,19 +286,18 @@ impl KiroProvider {
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
-            // 401/403 凭据问题
-            if matches!(status.as_u16(), 401 | 403) {
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                        continue;
-                    }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+            // 403 - 直接禁用并切换到下一个号
+            if status.as_u16() == 403 {
+                let has_available = self.token_manager.report_immediate_failure(ctx.id);
+                if !has_available {
+                    anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
                 }
+                last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
+                continue;
+            }
 
+            // 401 - 仍按累计失败处理
+            if status.as_u16() == 401 {
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -328,16 +344,15 @@ impl KiroProvider {
     /// 重试策略：
     /// - 每个凭据最多重试 MAX_RETRIES_PER_CREDENTIAL 次
     /// - 总重试次数 = min(凭据数量 × 每凭据重试次数, MAX_TOTAL_RETRIES)
-    /// - 硬上限 9 次，避免无限重试
+    /// - 硬上限 30 次，允许在大账号池中继续切号
     async fn call_api_with_retry(
         &self,
         request_body: &str,
         is_stream: bool,
     ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
-        let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
+        let max_retries = Self::max_retry_count(total_credentials);
         let mut last_error: Option<anyhow::Error> = None;
-        let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         // 尝试从请求体中提取模型信息
@@ -369,14 +384,11 @@ impl KiroProvider {
                 config.system_version, config.node_version, config.kiro_version, machine_id
             );
 
-            // 注入实际凭据的 profile_arn 到请求体
-            let body = Self::inject_profile_arn(request_body, &ctx.credentials.profile_arn);
-
             // 发送请求
             let response = match self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(body)
+                .body(request_body.to_string())
                 .header("content-type", "application/json")
                 .header("x-amzn-codewhisperer-optout", "true")
                 .header("x-amzn-kiro-agent-mode", "vibe")
@@ -419,10 +431,10 @@ impl KiroProvider {
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
 
-            // 402 Payment Required 且额度用尽：禁用凭据并故障转移
-            if status.as_u16() == 402 && Self::is_monthly_request_limit(&body) {
+            // 402 Payment Required：直接禁用凭据并故障转移
+            if status.as_u16() == 402 {
                 tracing::warn!(
-                    "API 请求失败（额度已用尽，禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    "API 请求失败（402，直接禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
                     status,
@@ -453,26 +465,44 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 401/403 - 更可能是凭据/权限问题：计入失败并允许故障转移
-            if matches!(status.as_u16(), 401 | 403) {
+            // 403 - 直接禁用并切换到下一个号
+            if status.as_u16() == 403 {
                 tracing::warn!(
-                    "API 请求失败（可能为凭据错误，尝试 {}/{}）: {} {}",
+                    "API 请求失败（403，直接禁用凭据并切换，尝试 {}/{}）: {} {}",
                     attempt + 1,
                     max_retries,
                     status,
                     body
                 );
 
-                // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
-                if Self::is_bearer_token_invalid(&body) && !force_refreshed.contains(&ctx.id) {
-                    force_refreshed.insert(ctx.id);
-                    tracing::info!("凭据 #{} token 疑似被上游失效，尝试强制刷新", ctx.id);
-                    if self.token_manager.force_refresh_token_for(ctx.id).await.is_ok() {
-                        tracing::info!("凭据 #{} token 强制刷新成功，重试请求", ctx.id);
-                        continue;
-                    }
-                    tracing::warn!("凭据 #{} token 强制刷新失败，计入失败", ctx.id);
+                let has_available = self.token_manager.report_immediate_failure(ctx.id);
+                if !has_available {
+                    anyhow::bail!(
+                        "{} API 请求失败（所有凭据已用尽）: {} {}",
+                        api_type,
+                        status,
+                        body
+                    );
                 }
+
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败: {} {}",
+                    api_type,
+                    status,
+                    body
+                ));
+                continue;
+            }
+
+            // 401 - 仍按累计失败处理
+            if status.as_u16() == 401 {
+                tracing::warn!(
+                    "API 请求失败（401，累计失败并允许故障转移，尝试 {}/{}）: {} {}",
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
 
                 let has_available = self.token_manager.report_failure(ctx.id);
                 if !has_available {
@@ -560,6 +590,10 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
+    fn max_retry_count(total_credentials: usize) -> usize {
+        (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES)
+    }
+
     fn is_monthly_request_limit(body: &str) -> bool {
         if body.contains("MONTHLY_REQUEST_COUNT") {
             return true;
@@ -582,19 +616,35 @@ impl KiroProvider {
             .and_then(|v| v.as_str())
             .is_some_and(|v| v == "MONTHLY_REQUEST_COUNT")
     }
-
-    /// 检查响应体是否包含 bearer token 失效的特征消息
-    ///
-    /// 当上游已使 accessToken 失效但本地 expiresAt 未到期时，
-    /// API 会返回 401/403 并携带此特征消息。
-    fn is_bearer_token_invalid(body: &str) -> bool {
-        body.contains("The bearer token included in the request is invalid")
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::config::Config;
+
+    fn create_test_provider(config: Config, credentials: KiroCredentials) -> KiroProvider {
+        let tm = MultiTokenManager::new(config, vec![credentials], None, None, false).unwrap();
+        KiroProvider::new(Arc::new(tm))
+    }
+
+    #[test]
+    fn test_base_url() {
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let provider = create_test_provider(config, credentials);
+        assert!(provider.base_url().contains("amazonaws.com"));
+        assert!(provider.base_url().contains("generateAssistantResponse"));
+    }
+
+    #[test]
+    fn test_base_domain() {
+        let mut config = Config::default();
+        config.region = "us-east-1".to_string();
+        let credentials = KiroCredentials::default();
+        let provider = create_test_provider(config, credentials);
+        assert_eq!(provider.base_domain(), "q.us-east-1.amazonaws.com");
+    }
 
     #[test]
     fn test_is_monthly_request_limit_detects_reason() {
@@ -615,44 +665,9 @@ mod tests {
     }
 
     #[test]
-    fn test_inject_profile_arn_with_some() {
-        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let arn = Some("arn:aws:codewhisperer:us-east-1:123:profile/ABC".to_string());
-        let result = KiroProvider::inject_profile_arn(body, &arn);
-        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(
-            json["profileArn"],
-            "arn:aws:codewhisperer:us-east-1:123:profile/ABC"
-        );
-        // 原有字段保留
-        assert_eq!(json["conversationState"]["conversationId"], "c1");
-    }
-
-    #[test]
-    fn test_inject_profile_arn_with_none() {
-        let body = r#"{"conversationState":{"conversationId":"c1"}}"#;
-        let result = KiroProvider::inject_profile_arn(body, &None);
-        // 不注入 profileArn，原样返回
-        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert!(json.get("profileArn").is_none());
-        assert_eq!(json["conversationState"]["conversationId"], "c1");
-    }
-
-    #[test]
-    fn test_inject_profile_arn_overwrites_existing() {
-        let body = r#"{"conversationState":{},"profileArn":"old-arn"}"#;
-        let arn = Some("new-arn".to_string());
-        let result = KiroProvider::inject_profile_arn(body, &arn);
-        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
-        assert_eq!(json["profileArn"], "new-arn");
-    }
-
-    #[test]
-    fn test_inject_profile_arn_invalid_json() {
-        let body = "not-valid-json";
-        let arn = Some("arn:test".to_string());
-        let result = KiroProvider::inject_profile_arn(body, &arn);
-        // 解析失败时原样返回
-        assert_eq!(result, "not-valid-json");
+    fn test_max_retry_count_caps_at_30() {
+        assert_eq!(KiroProvider::max_retry_count(1), 3);
+        assert_eq!(KiroProvider::max_retry_count(10), 30);
+        assert_eq!(KiroProvider::max_retry_count(40), 30);
     }
 }

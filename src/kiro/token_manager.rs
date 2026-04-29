@@ -1,7 +1,7 @@
 //! Token 管理模块
 //!
 //! 负责 Token 过期检测和刷新，支持 Social 和 IdC 认证方式
-//! 支持多凭据 (MultiTokenManager) 管理
+//! 支持单凭据 (TokenManager) 和多凭据 (MultiTokenManager) 管理
 
 use anyhow::bail;
 use chrono::{DateTime, Duration, Utc};
@@ -12,7 +12,9 @@ use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -24,6 +26,64 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::model::config::Config;
+
+/// Token 管理器
+///
+/// 负责管理凭据和 Token 的自动刷新
+pub struct TokenManager {
+    config: Config,
+    credentials: KiroCredentials,
+    proxy: Option<ProxyConfig>,
+}
+
+impl TokenManager {
+    /// 创建新的 TokenManager 实例
+    pub fn new(config: Config, credentials: KiroCredentials, proxy: Option<ProxyConfig>) -> Self {
+        Self {
+            config,
+            credentials,
+            proxy,
+        }
+    }
+
+    /// 获取凭据的引用
+    pub fn credentials(&self) -> &KiroCredentials {
+        &self.credentials
+    }
+
+    /// 获取配置的引用
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// 确保获取有效的访问 Token
+    ///
+    /// 如果 Token 过期或即将过期，会自动刷新
+    pub async fn ensure_valid_token(&mut self) -> anyhow::Result<String> {
+        if is_token_expired(&self.credentials) || is_token_expiring_soon(&self.credentials) {
+            self.credentials =
+                refresh_token(&self.credentials, &self.config, self.proxy.as_ref()).await?;
+
+            // 刷新后再次检查 token 时间有效性
+            if is_token_expired(&self.credentials) {
+                anyhow::bail!("刷新后的 Token 仍然无效或已过期");
+            }
+        }
+
+        self.credentials
+            .access_token
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))
+    }
+
+    /// 获取使用额度信息
+    ///
+    /// 调用 getUsageLimits API 查询当前账户的使用额度
+    pub async fn get_usage_limits(&mut self) -> anyhow::Result<UsageLimitsResponse> {
+        let token = self.ensure_valid_token().await?;
+        get_usage_limits(&self.credentials, &self.config, &token, self.proxy.as_ref()).await
+    }
+}
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -163,8 +223,7 @@ async fn refresh_social_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
-
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        // 400 + invalid_grant + Invalid refresh token provided -> refreshToken 永久失效
         if status.as_u16() == 400
             && body_text.contains("\"invalid_grant\"")
             && body_text.contains("Invalid refresh token provided")
@@ -260,8 +319,7 @@ async fn refresh_idc_token(
     let status = response.status();
     if !status.is_success() {
         let body_text = response.text().await.unwrap_or_default();
-
-        // 400 + invalid_grant + Invalid refresh token provided → refreshToken 永久失效
+        // 400 + invalid_grant + Invalid refresh token provided -> refreshToken 永久失效
         if status.as_u16() == 400
             && body_text.contains("\"invalid_grant\"")
             && body_text.contains("Invalid refresh token provided")
@@ -405,6 +463,8 @@ enum DisabledReason {
     Manual,
     /// 连续失败达到阈值后自动禁用
     TooManyFailures,
+    /// 403/402 等明确不可用场景，首次命中即禁用
+    ImmediateFailure,
     /// Token 刷新连续失败达到阈值后自动禁用
     TooManyRefreshFailures,
     /// 额度已用尽（如 MONTHLY_REQUEST_COUNT）
@@ -632,6 +692,17 @@ impl MultiTokenManager {
         &self.config
     }
 
+    /// 获取当前活动凭据的克隆
+    pub fn credentials(&self) -> KiroCredentials {
+        let entries = self.entries.lock();
+        let current_id = *self.current_id.lock();
+        entries
+            .iter()
+            .find(|e| e.id == current_id)
+            .map(|e| e.credentials.clone())
+            .unwrap_or_default()
+    }
+
     /// 获取凭据总数
     pub fn total_count(&self) -> usize {
         self.entries.lock().len()
@@ -786,7 +857,6 @@ impl MultiTokenManager {
                     return Ok(ctx);
                 }
                 Err(e) => {
-                    // refreshToken 永久失效 → 立即禁用，不累计重试
                     let has_available =
                         if e.downcast_ref::<RefreshTokenInvalidError>().is_some() {
                             tracing::warn!("凭据 #{} refreshToken 永久失效: {}", id, e);
@@ -804,9 +874,30 @@ impl MultiTokenManager {
         }
     }
 
+    /// 切换到下一个优先级最高的可用凭据（内部方法）
+    fn switch_to_next_by_priority(&self) {
+        let entries = self.entries.lock();
+        let mut current_id = self.current_id.lock();
+
+        // 选择优先级最高的未禁用凭据（排除当前凭据）
+        if let Some(entry) = entries
+            .iter()
+            .filter(|e| !e.disabled && e.id != *current_id)
+            .min_by_key(|e| e.credentials.priority)
+        {
+            *current_id = entry.id;
+            tracing::info!(
+                "已切换到凭据 #{}（优先级 {}）",
+                entry.id,
+                entry.credentials.priority
+            );
+        }
+    }
+
     /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
     ///
-    /// 纯粹按优先级选择，不排除当前凭据，用于优先级变更后立即生效
+    /// 与 `switch_to_next_by_priority` 不同，此方法不排除当前凭据，
+    /// 纯粹按优先级选择，用于优先级变更后立即生效
     fn select_highest_priority(&self) {
         let entries = self.entries.lock();
         let mut current_id = self.current_id.lock();
@@ -948,15 +1039,13 @@ impl MultiTokenManager {
                 .collect()
         };
 
-        // 序列化为 pretty JSON
-        let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
-
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
         if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| std::fs::write(path, &json))
+            tokio::task::block_in_place(|| write_credentials_file(path, &credentials))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         } else {
-            std::fs::write(path, &json).with_context(|| format!("回写凭据文件失败: {:?}", path))?;
+            write_credentials_file(path, &credentials)
+                .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
         }
 
         tracing::debug!("已回写凭据到文件: {:?}", path);
@@ -1144,6 +1233,54 @@ impl MultiTokenManager {
         result
     }
 
+    /// 报告指定凭据出现需要立即淘汰的失败。
+    ///
+    /// 用于处理 403/402 这类已经明确表明凭据当前不可用的场景：
+    /// - 首次命中立即禁用当前凭据
+    /// - 失败计数直接置为阈值，便于在管理面板中可视化
+    /// - 立即切换到下一个可用凭据
+    pub fn report_immediate_failure(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::ImmediateFailure);
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.failure_count = MAX_FAILURES_PER_CREDENTIAL;
+
+            tracing::error!("凭据 #{} 命中立即禁用条件，已被禁用", id);
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     /// 报告指定凭据额度已用尽
     ///
     /// 用于处理 402 Payment Required 且 reason 为 `MONTHLY_REQUEST_COUNT` 的场景：
@@ -1198,6 +1335,55 @@ impl MultiTokenManager {
     ///
     /// 连续刷新失败达到阈值后禁用凭据并切换，阈值内保持当前凭据不切换，
     /// 与 API 401/403 的累计失败策略保持一致。
+
+    /// 报告指定凭据的 refreshToken 永久失效（invalid_grant）。
+    ///
+    /// 立即禁用凭据，不累计、不重试。
+    /// 返回是否还有可用凭据。
+    pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
+        let result = {
+            let mut entries = self.entries.lock();
+            let mut current_id = self.current_id.lock();
+
+            let entry = match entries.iter_mut().find(|e| e.id == id) {
+                Some(e) => e,
+                None => return entries.iter().any(|e| !e.disabled),
+            };
+
+            if entry.disabled {
+                return entries.iter().any(|e| !e.disabled);
+            }
+
+            entry.last_used_at = Some(Utc::now().to_rfc3339());
+            entry.disabled = true;
+            entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
+
+            tracing::error!(
+                "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
+                id
+            );
+
+            if let Some(next) = entries
+                .iter()
+                .filter(|e| !e.disabled)
+                .min_by_key(|e| e.credentials.priority)
+            {
+                *current_id = next.id;
+                tracing::info!(
+                    "已切换到凭据 #{}（优先级 {}）",
+                    next.id,
+                    next.credentials.priority
+                );
+                true
+            } else {
+                tracing::error!("所有凭据均已禁用！");
+                false
+            }
+        };
+        self.save_stats_debounced();
+        result
+    }
+
     pub fn report_refresh_failure(&self, id: u64) -> bool {
         let result = {
             let mut entries = self.entries.lock();
@@ -1257,54 +1443,6 @@ impl MultiTokenManager {
         result
     }
 
-    /// 报告指定凭据的 refreshToken 永久失效（invalid_grant）。
-    ///
-    /// 立即禁用凭据，不累计、不重试。
-    /// 返回是否还有可用凭据。
-    pub fn report_refresh_token_invalid(&self, id: u64) -> bool {
-        let result = {
-            let mut entries = self.entries.lock();
-            let mut current_id = self.current_id.lock();
-
-            let entry = match entries.iter_mut().find(|e| e.id == id) {
-                Some(e) => e,
-                None => return entries.iter().any(|e| !e.disabled),
-            };
-
-            if entry.disabled {
-                return entries.iter().any(|e| !e.disabled);
-            }
-
-            entry.last_used_at = Some(Utc::now().to_rfc3339());
-            entry.disabled = true;
-            entry.disabled_reason = Some(DisabledReason::InvalidRefreshToken);
-
-            tracing::error!(
-                "凭据 #{} refreshToken 已失效 (invalid_grant)，已立即禁用",
-                id
-            );
-
-            if let Some(next) = entries
-                .iter()
-                .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
-            {
-                *current_id = next.id;
-                tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
-                    next.id,
-                    next.credentials.priority
-                );
-                true
-            } else {
-                tracing::error!("所有凭据均已禁用！");
-                false
-            }
-        };
-        self.save_stats_debounced();
-        result
-    }
-
     /// 切换到优先级最高的可用凭据
     ///
     /// 返回是否成功切换
@@ -1329,6 +1467,19 @@ impl MultiTokenManager {
             // 没有其他可用凭据，检查当前凭据是否可用
             entries.iter().any(|e| e.id == *current_id && !e.disabled)
         }
+    }
+
+    /// 获取使用额度信息
+    pub async fn get_usage_limits(&self) -> anyhow::Result<UsageLimitsResponse> {
+        let ctx = self.acquire_context(None).await?;
+        let effective_proxy = ctx.credentials.effective_proxy(self.proxy.as_ref());
+        get_usage_limits(
+            &ctx.credentials,
+            &self.config,
+            &ctx.token,
+            effective_proxy.as_ref(),
+        )
+        .await
     }
 
     // ========================================================================
@@ -1368,6 +1519,7 @@ impl MultiTokenManager {
                     disabled_reason: e.disabled_reason.map(|r| match r {
                         DisabledReason::Manual => "Manual",
                         DisabledReason::TooManyFailures => "TooManyFailures",
+                        DisabledReason::ImmediateFailure => "ImmediateFailure",
                         DisabledReason::TooManyRefreshFailures => "TooManyRefreshFailures",
                         DisabledReason::QuotaExceeded => "QuotaExceeded",
                         DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
@@ -1796,9 +1948,67 @@ impl Drop for MultiTokenManager {
     }
 }
 
+fn write_credentials_file(path: &Path, credentials: &[KiroCredentials]) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let temp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("json")
+    ));
+
+    let result = (|| -> anyhow::Result<()> {
+        let file = File::create(&temp_path)
+            .with_context(|| format!("创建临时凭据文件失败: {:?}", temp_path))?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, credentials).context("序列化凭据失败")?;
+        writer.flush().context("刷新临时凭据文件失败")?;
+        let file = writer.into_inner().map_err(|e| e.into_error())?;
+        file.sync_all().context("同步临时凭据文件失败")?;
+        replace_file(&temp_path, path)?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+
+    result
+}
+
+fn replace_file(temp_path: &Path, final_path: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    #[cfg(windows)]
+    {
+        if final_path.exists() {
+            std::fs::remove_file(final_path)
+                .with_context(|| format!("删除旧凭据文件失败: {:?}", final_path))?;
+        }
+    }
+
+    std::fs::rename(temp_path, final_path).with_context(|| {
+        format!(
+            "替换凭据文件失败: 临时文件={:?}, 目标文件={:?}",
+            temp_path, final_path
+        )
+    })?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_token_manager_new() {
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let tm = TokenManager::new(config, credentials, None);
+        assert!(tm.credentials().access_token.is_none());
+    }
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -1884,6 +2094,61 @@ mod tests {
         let result = manager.add_credential(duplicate).await;
         assert!(result.is_err());
         assert!(result.err().unwrap().to_string().contains("凭据已存在"));
+    }
+
+    #[test]
+    fn test_persist_credentials_writes_compact_json() {
+        let credentials_path = std::env::temp_dir().join(format!(
+            "kiro-credentials-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+
+        let config = Config::default();
+        let cred = KiroCredentials {
+            id: Some(7),
+            access_token: Some("access-token".to_string()),
+            refresh_token: Some("a".repeat(150)),
+            profile_arn: Some("arn:aws:test".to_string()),
+            expires_at: Some("2030-01-01T00:00:00Z".to_string()),
+            auth_method: Some("builder-id".to_string()),
+            client_id: Some("client-id".to_string()),
+            client_secret: Some("client-secret".to_string()),
+            priority: 2,
+            region: Some("us-east-1".to_string()),
+            auth_region: Some("us-east-1".to_string()),
+            api_region: Some("us-east-1".to_string()),
+            machine_id: Some("machine-id".to_string()),
+            email: Some("tao@example.com".to_string()),
+            subscription_title: Some("KIRO PRO+".to_string()),
+            proxy_url: Some("http://127.0.0.1:8080".to_string()),
+            proxy_username: Some("user".to_string()),
+            proxy_password: Some("pass".to_string()),
+            disabled: true,
+        };
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![cred],
+            None,
+            Some(credentials_path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager.persist_credentials().unwrap();
+
+        let content = std::fs::read_to_string(&credentials_path).unwrap();
+        let persisted: Vec<KiroCredentials> = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].id, Some(7));
+        assert_eq!(persisted[0].auth_method.as_deref(), Some("idc"));
+        assert_eq!(persisted[0].priority, 2);
+        assert_eq!(persisted[0].subscription_title.as_deref(), Some("KIRO PRO+"));
+        assert!(persisted[0].disabled);
+        assert_eq!(content, serde_json::to_string(&persisted).unwrap());
+
+        std::fs::remove_file(&credentials_path).unwrap();
     }
 
     // MultiTokenManager 测试
@@ -1988,11 +2253,18 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
-        let initial_id = manager.snapshot().current_id;
+        // 初始是第一个凭据
+        assert_eq!(
+            manager.credentials().refresh_token,
+            Some("token1".to_string())
+        );
 
         // 切换到下一个
         assert!(manager.switch_to_next());
-        assert_ne!(manager.snapshot().current_id, initial_id);
+        assert_eq!(
+            manager.credentials().refresh_token,
+            Some("token2".to_string())
+        );
     }
 
     #[test]
@@ -2140,6 +2412,26 @@ mod tests {
         // 再禁用第二个后，无可用凭据
         assert!(!manager.report_quota_exhausted(2));
         assert_eq!(manager.available_count(), 0);
+    }
+
+    #[test]
+    fn test_multi_token_manager_immediate_disable_switches_on_first_failure() {
+        let config = Config::default();
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
+
+        let manager =
+            MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
+
+        assert!(manager.report_immediate_failure(1));
+
+        let snapshot = manager.snapshot();
+        let first = snapshot.entries.iter().find(|e| e.id == 1).unwrap();
+        assert!(first.disabled);
+        assert_eq!(first.failure_count, MAX_FAILURES_PER_CREDENTIAL);
+        assert_eq!(first.disabled_reason.as_deref(), Some("ImmediateFailure"));
+        assert_eq!(snapshot.current_id, 2);
+        assert_eq!(snapshot.available, 1);
     }
 
     #[tokio::test]
