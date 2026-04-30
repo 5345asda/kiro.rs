@@ -145,9 +145,10 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
-    /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
+    /// - 401: 视为凭据鉴权问题，计入失败次数并允许故障转移
     /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
-    /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
+    /// - 403/429: 立即禁用当前凭据并切换到下一个凭据
+    /// - 408/5xx/网络等瞬态错误: 重试但不禁用或切换凭据
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
@@ -162,9 +163,10 @@ impl KiroProvider {
     ///
     /// 支持多凭据故障转移：
     /// - 400 Bad Request: 直接返回错误，不计入凭据失败
-    /// - 401/403: 视为凭据/权限问题，计入失败次数并允许故障转移
+    /// - 401: 视为凭据鉴权问题，计入失败次数并允许故障转移
     /// - 402 MONTHLY_REQUEST_COUNT: 视为额度用尽，禁用凭据并切换
-    /// - 429/5xx/网络等瞬态错误: 重试但不禁用或切换凭据（避免误把所有凭据锁死）
+    /// - 403/429: 立即禁用当前凭据并切换到下一个凭据
+    /// - 408/5xx/网络等瞬态错误: 重试但不禁用或切换凭据
     ///
     /// # Arguments
     /// * `request_body` - JSON 格式的请求体字符串
@@ -286,8 +288,16 @@ impl KiroProvider {
                 anyhow::bail!("MCP 请求失败: {} {}", status, body);
             }
 
-            // 403 - 直接禁用并切换到下一个号
-            if status.as_u16() == 403 {
+            // 403/429 - 直接禁用并切换到下一个号
+            if Self::is_immediate_disable_status(status.as_u16()) {
+                tracing::warn!(
+                    "MCP 请求失败（{}，直接禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    status.as_u16(),
+                    attempt + 1,
+                    max_retries,
+                    status,
+                    body
+                );
                 let has_available = self.token_manager.report_immediate_failure(ctx.id);
                 if !has_available {
                     anyhow::bail!("MCP 请求失败（所有凭据已用尽）: {} {}", status, body);
@@ -307,7 +317,7 @@ impl KiroProvider {
             }
 
             // 瞬态错误
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "MCP 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -465,10 +475,11 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 403 - 直接禁用并切换到下一个号
-            if status.as_u16() == 403 {
+            // 403/429 - 直接禁用并切换到下一个号
+            if Self::is_immediate_disable_status(status.as_u16()) {
                 tracing::warn!(
-                    "API 请求失败（403，直接禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    "API 请求失败（{}，直接禁用凭据并切换，尝试 {}/{}）: {} {}",
+                    status.as_u16(),
                     attempt + 1,
                     max_retries,
                     status,
@@ -523,9 +534,8 @@ impl KiroProvider {
                 continue;
             }
 
-            // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
-            // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
-            if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
+            // 408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
+            if status.as_u16() == 408 || status.is_server_error() {
                 tracing::warn!(
                     "API 请求失败（上游瞬态错误，尝试 {}/{}）: {} {}",
                     attempt + 1,
@@ -592,6 +602,10 @@ impl KiroProvider {
 
     fn max_retry_count(total_credentials: usize) -> usize {
         (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES)
+    }
+
+    fn is_immediate_disable_status(status: u16) -> bool {
+        matches!(status, 403 | 429)
     }
 
     fn is_monthly_request_limit(body: &str) -> bool {
@@ -669,5 +683,16 @@ mod tests {
         assert_eq!(KiroProvider::max_retry_count(1), 3);
         assert_eq!(KiroProvider::max_retry_count(10), 30);
         assert_eq!(KiroProvider::max_retry_count(40), 30);
+    }
+
+    #[test]
+    fn test_immediate_disable_statuses_include_429() {
+        assert!(KiroProvider::is_immediate_disable_status(403));
+        assert!(KiroProvider::is_immediate_disable_status(429));
+
+        assert!(!KiroProvider::is_immediate_disable_status(401));
+        assert!(!KiroProvider::is_immediate_disable_status(402));
+        assert!(!KiroProvider::is_immediate_disable_status(408));
+        assert!(!KiroProvider::is_immediate_disable_status(500));
     }
 }
