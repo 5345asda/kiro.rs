@@ -126,48 +126,6 @@ pub async fn delete_credential(
     }
 }
 
-/// GET /api/admin/premium-credentials
-/// 获取高级凭证库摘要
-pub async fn get_premium_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.get_premium_credentials() {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// POST /api/admin/premium-credentials/export
-/// 导出高级凭证库完整凭据
-pub async fn export_premium_credentials(State(state): State<AdminState>) -> impl IntoResponse {
-    match state.service.export_premium_credentials() {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// POST /api/admin/premium-credentials/:id/restore
-/// 将高级凭证恢复到普通池
-pub async fn restore_premium_credential(
-    State(state): State<AdminState>,
-    Path(id): Path<u64>,
-) -> impl IntoResponse {
-    match state.service.restore_premium_credential(id) {
-        Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// DELETE /api/admin/premium-credentials/:id
-/// 从高级凭证库删除凭据
-pub async fn delete_premium_credential(
-    State(state): State<AdminState>,
-    Path(id): Path<u64>,
-) -> impl IntoResponse {
-    match state.service.delete_premium_credential(id) {
-        Ok(_) => Json(SuccessResponse::new(format!("高级凭证 #{} 已删除", id))).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
 /// POST /api/admin/credentials/:id/refresh
 /// 强制刷新凭据 Token
 pub async fn force_refresh_token(
