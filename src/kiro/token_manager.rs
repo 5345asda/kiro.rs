@@ -68,6 +68,21 @@ fn now_epoch_ms() -> u64 {
     Utc::now().timestamp_millis().max(0) as u64
 }
 
+fn model_requires_paid_subscription(model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    let model_lower = model.to_lowercase();
+
+    model_lower.contains("opus")
+        || (model_lower.contains("sonnet")
+            && (model_lower.contains("4-6") || model_lower.contains("4.6")))
+}
+
+fn credential_supports_requested_model(credentials: &KiroCredentials, model: Option<&str>) -> bool {
+    !model_requires_paid_subscription(model) || credentials.supports_paid_models()
+}
+
 /// 验证 refreshToken 的基本有效性
 pub(crate) fn validate_refresh_token(credentials: &KiroCredentials) -> anyhow::Result<()> {
     let refresh_token = credentials
@@ -873,15 +888,10 @@ impl MultiTokenManager {
     /// - round_robin 模式：按当前游标轮换选择可用凭据，降低高并发热点账号重复命中
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 Opus/Sonnet 4.6 需要付费订阅）
     fn select_next_credential(&self, model: Option<&str>) -> Option<SelectedCredential> {
         let entries = self.entries.lock();
         let now_ms = now_epoch_ms();
-
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
 
         let mode = self.load_balancing_mode.lock().clone();
         let mode = mode.as_str();
@@ -889,7 +899,7 @@ impl MultiTokenManager {
             if entry.disabled {
                 return false;
             }
-            if is_opus && !entry.credentials.supports_opus() {
+            if !credential_supports_requested_model(&entry.credentials, model) {
                 return false;
             }
             true
@@ -1068,7 +1078,7 @@ impl MultiTokenManager {
     /// Token 刷新失败会累计到当前凭据，达到阈值后禁用并切换
     ///
     /// # 参数
-    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
+    /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 Opus/Sonnet 4.6 需要付费订阅）
     pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
         let total = self.total_count();
         let max_attempts =
@@ -1100,7 +1110,10 @@ impl MultiTokenManager {
                     entries
                         .iter()
                         .find(|e| {
-                            e.id == current_id && !e.disabled && !e.runtime.is_cooling_down(now_ms)
+                            e.id == current_id
+                                && !e.disabled
+                                && !e.runtime.is_cooling_down(now_ms)
+                                && credential_supports_requested_model(&e.credentials, model)
                         })
                         .map(|e| SelectedCredential {
                             id: e.id,
@@ -2959,6 +2972,76 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &first_again));
         assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn test_model_requires_paid_subscription_detects_sonnet_4_6_aliases() {
+        assert!(model_requires_paid_subscription(Some("claude-sonnet-4.6")));
+        assert!(model_requires_paid_subscription(Some("claude-sonnet-4-6")));
+        assert!(model_requires_paid_subscription(Some(
+            "claude-sonnet-4-6-thinking"
+        )));
+        assert!(model_requires_paid_subscription(Some("claude-opus-4.6")));
+        assert!(!model_requires_paid_subscription(Some("claude-sonnet-4.5")));
+        assert!(!model_requires_paid_subscription(Some("claude-haiku-4.5")));
+        assert!(!model_requires_paid_subscription(None));
+    }
+
+    async fn assert_paid_model_routes_to_pro_credential(model: &str) {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut free_cred = test_credential(1, 0);
+        free_cred.subscription_title = Some("KIRO FREE".to_string());
+
+        let mut pro_cred = test_credential(2, 1);
+        pro_cred.subscription_title = Some("KIRO PRO".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![free_cred, pro_cred], None, None, false).unwrap();
+
+        let ctx = manager.acquire_context(Some(model)).await.unwrap();
+
+        assert_eq!(ctx.id, 2, "model={}", model);
+        assert_eq!(ctx.token, "test-access-token-2");
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_routes_sonnet_4_6_to_pro_credential() {
+        assert_paid_model_routes_to_pro_credential("claude-sonnet-4.6").await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_routes_sonnet_4_6_thinking_to_pro_credential() {
+        assert_paid_model_routes_to_pro_credential("claude-sonnet-4-6-thinking").await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_routes_opus_to_pro_credential() {
+        assert_paid_model_routes_to_pro_credential("claude-opus-4.6").await;
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_allows_sonnet_4_5_on_free_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut free_cred = test_credential(1, 0);
+        free_cred.subscription_title = Some("KIRO FREE".to_string());
+
+        let mut pro_cred = test_credential(2, 1);
+        pro_cred.subscription_title = Some("KIRO PRO".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![free_cred, pro_cred], None, None, false).unwrap();
+
+        let ctx = manager
+            .acquire_context(Some("claude-sonnet-4.5"))
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "test-access-token-1");
     }
 
     #[tokio::test]
