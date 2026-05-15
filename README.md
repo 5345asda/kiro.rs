@@ -34,8 +34,8 @@
 - **Anthropic API 兼容**: 完整支持 Anthropic Claude API 格式
 - **流式响应**: 支持 SSE (Server-Sent Events) 流式输出
 - **Token 自动刷新**: 自动管理和刷新 OAuth Token
-- **多凭据支持**: 支持配置多个凭据，按优先级自动故障转移
-- **负载均衡**: 支持 `priority`（按优先级）和 `balanced`（均衡分配）两种模式
+- **多凭据支持**: 支持配置多个凭据，按模型订阅类型和成功次数自动故障转移
+- **负载均衡**: 支持 `priority`（模型分组 + 成功次数少优先）、`balanced`、`round_robin` 和 `adaptive_round_robin` 模式
 - **智能重试**: 单凭据最多重试 3 次，单请求最多重试 9 次
 - **凭据回写**: 多凭据格式下自动回写刷新后的 Token
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
@@ -195,7 +195,7 @@ docker-compose up
 | `proxyUsername` | string | - | 代理用户名 |
 | `proxyPassword` | string | - | 代理密码 |
 | `adminApiKey` | string | - | Admin API 密钥，配置后启用凭据管理 API 和 Web 管理界面 |
-| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（按优先级）或 `balanced`（均衡分配） |
+| `loadBalancingMode` | string | `priority` | 负载均衡模式：`priority`（模型分组 + 成功次数少优先）、`balanced`、`round_robin` 或 `adaptive_round_robin` |
 | `extractThinking` | boolean | `true` | 非流式响应的 thinking 块提取。启用后 `<thinking>` 标签会被解析为独立的 `thinking` 内容块 |
 | `defaultEndpoint` | string | `ide` | 默认 Kiro 端点。凭据未显式指定 `endpoint` 时使用。当前支持：`ide` |
 
@@ -242,7 +242,6 @@ docker-compose up
 | `authMethod`   | string | 认证方式：`social` 或 `idc`                       |
 | `clientId`     | string | IdC 登录的客户端 ID（IdC 认证必填）                     |
 | `clientSecret` | string | IdC 登录的客户端密钥（IdC 认证必填）                      |
-| `priority`     | number | 凭据优先级，数字越小越优先，默认为 0                         |
 | `region`       | string | 凭据级 Auth Region, 兼容字段                       |
 | `authRegion`   | string | 凭据级 Auth Region，用于 Token 刷新, 未配置时回退到 region |
 | `apiRegion`    | string | 凭据级 API Region，用于 API 请求                    |
@@ -278,8 +277,7 @@ docker-compose up
    {
       "refreshToken": "第一个凭据的刷新token",
       "expiresAt": "2025-12-31T02:32:45.144Z",
-      "authMethod": "social",
-      "priority": 0
+      "authMethod": "social"
    },
    {
       "refreshToken": "第二个凭据的刷新token",
@@ -288,7 +286,6 @@ docker-compose up
       "clientId": "xxxxxxxxx",
       "clientSecret": "xxxxxxxxx",
       "region": "us-east-2",
-      "priority": 1,
       "proxyUrl": "socks5://proxy.example.com:1080",
       "proxyUsername": "user",
       "proxyPassword": "pass"
@@ -297,14 +294,15 @@ docker-compose up
       "refreshToken": "第三个凭据（显式不走代理）",
       "expiresAt": "2025-12-31T02:32:45.144Z",
       "authMethod": "social",
-      "priority": 2,
       "proxyUrl": "direct"
    }
 ]
 ```
 
 多凭据特性：
-- 按 `priority` 字段排序，数字越小优先级越高（默认为 0）
+- 高级模型只路由到明确识别为 Pro 或更高订阅的凭据
+- 普通模型优先使用 Free 凭据，Free 不可用时再回退到未知订阅或 Pro 凭据
+- 同一模型分组内优先使用成功次数更少的凭据，降低热点账号压力
 - 单凭据最多重试 3 次，单请求最多重试 9 次
 - 自动故障转移到下一个可用凭据
 - 多凭据格式下 Token 刷新后自动回写到源文件
@@ -458,7 +456,6 @@ RUST_LOG=debug ./target/release/kiro-rs
   - `POST /api/admin/credentials/reset-all` - 启动所有账号并重置失败计数（批量内存处理后只回写一次凭据文件）
   - `DELETE /api/admin/credentials/:id` - 删除凭据
   - `POST /api/admin/credentials/:id/disabled` - 设置凭据禁用状态
-  - `POST /api/admin/credentials/:id/priority` - 设置凭据优先级
   - `POST /api/admin/credentials/:id/reset` - 重置失败计数
   - `GET /api/admin/credentials/:id/balance` - 获取凭据余额
 

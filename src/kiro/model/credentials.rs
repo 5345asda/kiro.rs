@@ -46,11 +46,6 @@ pub struct KiroCredentials {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_secret: Option<String>,
 
-    /// 凭据优先级（数字越小优先级越高，默认为 0）
-    #[serde(default)]
-    #[serde(skip_serializing_if = "is_zero")]
-    pub priority: u32,
-
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,11 +106,6 @@ pub struct KiroCredentials {
     pub endpoint: Option<String>,
 }
 
-/// 判断是否为零（用于跳过序列化）
-fn is_zero(value: &u32) -> bool {
-    *value == 0
-}
-
 fn canonicalize_auth_method_value(value: &str) -> &str {
     if value.eq_ignore_ascii_case("builder-id") || value.eq_ignore_ascii_case("iam") {
         "idc"
@@ -124,6 +114,13 @@ fn canonicalize_auth_method_value(value: &str) -> &str {
     } else {
         value
     }
+}
+
+fn contains_free_subscription_marker(title: &str) -> bool {
+    title
+        .as_bytes()
+        .windows(4)
+        .any(|window| window.eq_ignore_ascii_case(b"FREE"))
 }
 
 /// 凭据配置（支持单对象或数组格式）
@@ -165,7 +162,7 @@ impl CredentialsConfig {
         Ok(config)
     }
 
-    /// 转换为按优先级排序的凭据列表
+    /// 转换为凭据列表，保留文件顺序
     pub fn into_sorted_credentials(self) -> Vec<KiroCredentials> {
         match self {
             CredentialsConfig::Single(mut cred) => {
@@ -173,8 +170,6 @@ impl CredentialsConfig {
                 vec![cred]
             }
             CredentialsConfig::Multiple(mut creds) => {
-                // 按优先级排序（数字越小优先级越高）
-                creds.sort_by_key(|c| c.priority);
                 for cred in &mut creds {
                     cred.canonicalize_auth_method();
                 }
@@ -252,13 +247,20 @@ impl KiroCredentials {
     pub fn supports_paid_models(&self) -> bool {
         match &self.subscription_title {
             Some(title) => {
-                let title_upper = title.to_uppercase();
                 // 如果包含 FREE，则不支持付费订阅模型
-                !title_upper.contains("FREE")
+                !contains_free_subscription_marker(title)
             }
             // 高级模型只允许明确识别为非 Free 的凭据，避免未知订阅的普通凭据占用请求。
             None => false,
         }
+    }
+
+    /// 检查凭据是否明确识别为 Free 订阅
+    pub fn is_free_subscription(&self) -> bool {
+        self.subscription_title
+            .as_deref()
+            .map(contains_free_subscription_marker)
+            .unwrap_or(false)
     }
 
     /// 检查是否为 API Key 凭据
@@ -330,7 +332,6 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
-            priority: 0,
             region: None,
             auth_region: None,
             api_region: None,
@@ -349,7 +350,6 @@ mod tests {
         assert!(json.contains("accessToken"));
         assert!(json.contains("authMethod"));
         assert!(!json.contains("refreshToken"));
-        // priority 为 0 时不序列化
         assert!(!json.contains("priority"));
     }
 
@@ -359,20 +359,6 @@ mod tests {
             KiroCredentials::default_credentials_path(),
             "credentials.json"
         );
-    }
-
-    #[test]
-    fn test_priority_default() {
-        let json = r#"{"refreshToken": "test"}"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
-        assert_eq!(creds.priority, 0);
-    }
-
-    #[test]
-    fn test_priority_explicit() {
-        let json = r#"{"refreshToken": "test", "priority": 5}"#;
-        let creds = KiroCredentials::from_json(json).unwrap();
-        assert_eq!(creds.priority, 5);
     }
 
     #[test]
@@ -394,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_credentials_config_priority_sorting() {
+    fn test_credentials_config_preserves_file_order() {
         let json = r#"[
             {"refreshToken": "t1", "priority": 2},
             {"refreshToken": "t2", "priority": 0},
@@ -403,10 +389,9 @@ mod tests {
         let config: CredentialsConfig = serde_json::from_str(json).unwrap();
         let list = config.into_sorted_credentials();
 
-        // 验证按优先级排序
-        assert_eq!(list[0].refresh_token, Some("t2".to_string())); // priority 0
-        assert_eq!(list[1].refresh_token, Some("t3".to_string())); // priority 1
-        assert_eq!(list[2].refresh_token, Some("t1".to_string())); // priority 2
+        assert_eq!(list[0].refresh_token, Some("t1".to_string()));
+        assert_eq!(list[1].refresh_token, Some("t2".to_string()));
+        assert_eq!(list[2].refresh_token, Some("t3".to_string()));
     }
 
     // ============ Region 字段测试 ============
@@ -448,7 +433,6 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
-            priority: 0,
             region: Some("eu-west-1".to_string()),
             auth_region: None,
             api_region: None,
@@ -479,7 +463,6 @@ mod tests {
             auth_method: None,
             client_id: None,
             client_secret: None,
-            priority: 0,
             region: None,
             auth_region: None,
             api_region: None,
@@ -577,7 +560,6 @@ mod tests {
         assert_eq!(creds.auth_method, Some("idc".to_string()));
         assert_eq!(creds.client_id, Some("client123".to_string()));
         assert_eq!(creds.client_secret, Some("secret456".to_string()));
-        assert_eq!(creds.priority, 5);
         assert_eq!(creds.region, Some("ap-northeast-1".to_string()));
     }
 
@@ -593,7 +575,6 @@ mod tests {
             auth_method: Some("social".to_string()),
             client_id: None,
             client_secret: None,
-            priority: 3,
             region: Some("us-west-2".to_string()),
             auth_region: None,
             api_region: None,
@@ -614,7 +595,6 @@ mod tests {
         assert_eq!(parsed.id, original.id);
         assert_eq!(parsed.access_token, original.access_token);
         assert_eq!(parsed.refresh_token, original.refresh_token);
-        assert_eq!(parsed.priority, original.priority);
         assert_eq!(parsed.region, original.region);
         assert_eq!(parsed.machine_id, original.machine_id);
     }

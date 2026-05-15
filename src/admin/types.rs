@@ -24,8 +24,6 @@ pub struct CredentialsStatusResponse {
 pub struct CredentialStatusItem {
     /// 凭据唯一 ID
     pub id: u64,
-    /// 优先级（数字越小优先级越高）
-    pub priority: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -46,6 +44,8 @@ pub struct CredentialStatusItem {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 订阅等级（KIRO PRO / KIRO FREE 等）
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -74,14 +74,6 @@ pub struct SetDisabledRequest {
     pub disabled: bool,
 }
 
-/// 修改优先级请求
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SetPriorityRequest {
-    /// 新优先级值
-    pub priority: u32,
-}
-
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,10 +90,6 @@ pub struct AddCredentialRequest {
 
     /// OIDC Client Secret（IdC 认证需要）
     pub client_secret: Option<String>,
-
-    /// 优先级（可选，默认 0）
-    #[serde(default)]
-    pub priority: u32,
 
     /// 凭据级 Region 配置（用于 OIDC token 刷新）
     /// 未配置时回退到 config.json 的全局 region

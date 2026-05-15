@@ -21,6 +21,13 @@ use super::types::{
 /// 余额缓存过期时间（秒），5 分钟
 const BALANCE_CACHE_TTL_SECS: i64 = 300;
 
+fn subscription_title_is_free(title: &str) -> bool {
+    title
+        .as_bytes()
+        .windows(4)
+        .any(|window| window.eq_ignore_ascii_case(b"FREE"))
+}
+
 /// 缓存的余额条目（含时间戳）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedBalance {
@@ -70,7 +77,6 @@ impl AdminService {
             .into_iter()
             .map(|entry| CredentialStatusItem {
                 id: entry.id,
-                priority: entry.priority,
                 disabled: entry.disabled,
                 failure_count: entry.failure_count,
                 is_current: entry.id == snapshot.current_id,
@@ -81,6 +87,7 @@ impl AdminService {
                 api_key_hash: entry.api_key_hash,
                 masked_api_key: entry.masked_api_key,
                 email: entry.email,
+                subscription_title: entry.subscription_title,
                 success_count: entry.success_count,
                 last_used_at: entry.last_used_at.clone(),
                 has_proxy: entry.has_proxy,
@@ -91,8 +98,21 @@ impl AdminService {
             })
             .collect();
 
-        // 按优先级排序（数字越小优先级越高）
-        credentials.sort_by_key(|c| c.priority);
+        // 展示排序只在 Admin 读取时执行，避免影响请求热路径。
+        credentials.sort_by_cached_key(|c| {
+            let paid_rank = c
+                .subscription_title
+                .as_deref()
+                .map(|title| {
+                    if subscription_title_is_free(title) {
+                        1
+                    } else {
+                        0
+                    }
+                })
+                .unwrap_or(1);
+            (paid_rank, c.disabled, c.success_count, c.id)
+        });
 
         CredentialsStatusResponse {
             total: snapshot.total,
@@ -117,13 +137,6 @@ impl AdminService {
             let _ = self.token_manager.switch_to_next();
         }
         Ok(())
-    }
-
-    /// 设置凭据优先级
-    pub fn set_priority(&self, id: u64, priority: u32) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .set_priority(id, priority)
-            .map_err(|e| self.classify_error(e, id))
     }
 
     /// 重置失败计数并重新启用
@@ -274,7 +287,6 @@ impl AdminService {
             auth_method: Some(req.auth_method),
             client_id: req.client_id,
             client_secret: req.client_secret,
-            priority: req.priority,
             region: req.region,
             auth_region: req.auth_region,
             api_region: req.api_region,
@@ -428,7 +440,7 @@ impl AdminService {
 
     // ============ 错误分类 ============
 
-    /// 分类简单操作错误（set_disabled, set_priority, reset_and_enable）
+    /// 分类简单操作错误（set_disabled, reset_and_enable）
     fn classify_error(&self, e: anyhow::Error, id: u64) -> AdminServiceError {
         let msg = e.to_string();
         if msg.contains("不存在") {

@@ -52,7 +52,7 @@ async fn main() {
     // 判断是否为多凭据格式（用于刷新后回写）
     let is_multiple_format = credentials_config.is_multiple();
 
-    // 转换为按优先级排序的凭据列表
+    // 转换为凭据列表，路由时再按模型订阅分组和成功次数选择
     let mut credentials_list = credentials_config.into_sorted_credentials();
 
     // 检查 KIRO_API_KEY 环境变量，自动创建 API Key 凭据
@@ -60,11 +60,10 @@ async fn main() {
         if kiro_api_key.is_empty() {
             tracing::warn!("KIRO_API_KEY 环境变量已设置但为空，视为未配置");
         } else {
-            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据（最高优先级）");
+            tracing::info!("检测到 KIRO_API_KEY 环境变量，添加 API Key 凭据");
             let api_key_cred = KiroCredentials {
                 kiro_api_key: Some(kiro_api_key),
                 auth_method: Some("api_key".to_string()),
-                priority: 0,
                 ..Default::default()
             };
             credentials_list.insert(0, api_key_cred);
@@ -204,7 +203,6 @@ async fn main() {
         tracing::info!("Admin API:");
         tracing::info!("  GET  /api/admin/credentials");
         tracing::info!("  POST /api/admin/credentials/:index/disabled");
-        tracing::info!("  POST /api/admin/credentials/:index/priority");
         tracing::info!("  POST /api/admin/credentials/:index/reset");
         tracing::info!("  POST /api/admin/credentials/reset-all");
         tracing::info!("  GET  /api/admin/credentials/:index/balance");

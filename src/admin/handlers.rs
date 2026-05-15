@@ -9,8 +9,7 @@ use axum::{
 use super::{
     middleware::AdminState,
     types::{
-        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SetPriorityRequest,
-        SuccessResponse,
+        AddCredentialRequest, SetDisabledRequest, SetLoadBalancingModeRequest, SuccessResponse,
     },
 };
 
@@ -33,23 +32,6 @@ pub async fn set_credential_disabled(
             let action = if payload.disabled { "禁用" } else { "启用" };
             Json(SuccessResponse::new(format!("凭据 #{} 已{}", id, action))).into_response()
         }
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
-    }
-}
-
-/// POST /api/admin/credentials/:id/priority
-/// 设置凭据优先级
-pub async fn set_credential_priority(
-    State(state): State<AdminState>,
-    Path(id): Path<u64>,
-    Json(payload): Json<SetPriorityRequest>,
-) -> impl IntoResponse {
-    match state.service.set_priority(id, payload.priority) {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} 优先级已设置为 {}",
-            id, payload.priority
-        )))
-        .into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

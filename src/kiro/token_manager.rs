@@ -80,7 +80,24 @@ fn model_requires_paid_subscription(model: Option<&str>) -> bool {
 }
 
 fn credential_supports_requested_model(credentials: &KiroCredentials, model: Option<&str>) -> bool {
-    !model_requires_paid_subscription(model) || credentials.supports_paid_models()
+    credential_model_preference_rank(credentials, model).is_some()
+}
+
+fn credential_model_preference_rank(
+    credentials: &KiroCredentials,
+    model: Option<&str>,
+) -> Option<u8> {
+    if model_requires_paid_subscription(model) {
+        return credentials.supports_paid_models().then_some(0);
+    }
+
+    if credentials.is_free_subscription() {
+        Some(0)
+    } else if credentials.supports_paid_models() {
+        Some(2)
+    } else {
+        Some(1)
+    }
 }
 
 /// 验证 refreshToken 的基本有效性
@@ -534,6 +551,24 @@ struct CredentialEntry {
     runtime: Arc<CredentialRuntimeState>,
 }
 
+fn credential_request_rank(
+    entry: &CredentialEntry,
+    model: Option<&str>,
+) -> Option<(u8, u64, u32, u32, u64)> {
+    let model_rank = credential_model_preference_rank(&entry.credentials, model)?;
+    let failure_rank = entry
+        .failure_count
+        .saturating_add(entry.immediate_failure_count)
+        .saturating_add(entry.refresh_failure_count);
+    Some((
+        model_rank,
+        entry.success_count,
+        failure_rank,
+        entry.runtime.in_flight.load(Ordering::Relaxed),
+        entry.id,
+    ))
+}
+
 /// 禁用原因
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DisabledReason {
@@ -570,8 +605,6 @@ struct StatsEntry {
 pub struct CredentialEntrySnapshot {
     /// 凭据唯一 ID
     pub id: u64,
-    /// 优先级
-    pub priority: u32,
     /// 是否被禁用
     pub disabled: bool,
     /// 连续失败次数
@@ -590,6 +623,8 @@ pub struct CredentialEntrySnapshot {
     pub masked_api_key: Option<String>,
     /// 用户邮箱（用于前端显示）
     pub email: Option<String>,
+    /// 订阅等级（用于前端展示和排序）
+    pub subscription_title: Option<String>,
     /// API 调用成功次数
     pub success_count: u64,
     /// 最后一次 API 调用时间（RFC3339 格式）
@@ -647,7 +682,7 @@ pub struct ClearImmediateFailureDisabledResult {
 
 /// 多凭据 Token 管理器
 ///
-/// 支持多个凭据的管理，实现固定优先级 + 故障转移策略
+/// 支持多个凭据的管理，实现按模型分组 + 低成功次数优先的故障转移策略
 /// 故障统计基于 API 调用结果，而非 Token 刷新结果
 pub struct MultiTokenManager {
     config: Config,
@@ -793,12 +828,13 @@ impl MultiTokenManager {
             anyhow::bail!("检测到重复的凭据 ID: {:?}", duplicate_ids);
         }
 
-        // 选择初始凭据：优先级最高（priority 最小）的可用凭据，无可用凭据时为 0
+        // 选择初始凭据：普通模型优先 Free，同一分组内成功次数少优先。
         let initial_id = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
-            .map(|e| e.id)
+            .filter_map(|e| credential_request_rank(e, None).map(|rank| (rank, e.id)))
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, id)| id)
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
@@ -883,7 +919,7 @@ impl MultiTokenManager {
 
     /// 根据负载均衡模式选择下一个凭据
     ///
-    /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
+    /// - priority 模式：按模型分组选择；普通模型优先 Free，高级模型只选 Pro，同组内成功次数少优先
     /// - balanced 模式：均衡选择可用凭据
     /// - round_robin 模式：按当前游标轮换选择可用凭据，降低高并发热点账号重复命中
     ///
@@ -942,16 +978,17 @@ impl MultiTokenManager {
                     .saturating_add(entry.immediate_failure_count)
                     .saturating_add(entry.refresh_failure_count);
                 (
+                    credential_model_preference_rank(&entry.credentials, model).unwrap_or(u8::MAX),
                     health_rank,
                     in_flight,
                     failure_rank,
-                    entry.credentials.priority,
                     entry.success_count,
+                    entry.id,
                 )
             };
 
             let mut best_index: Option<usize> = None;
-            let mut best_key = (u8::MAX, u32::MAX, u32::MAX, u32::MAX, u64::MAX);
+            let mut best_key = (u8::MAX, u8::MAX, u32::MAX, u32::MAX, u64::MAX, u64::MAX);
             for offset in 0..probe_limit {
                 let index = (start_index + offset) % len;
                 let entry = &entries[index];
@@ -987,7 +1024,7 @@ impl MultiTokenManager {
 
             // 饥饿保护：短探测窗口都在忙时全池找最低负载，但仍优先保住已证明可用的凭据。
             let mut best_index: Option<usize> = None;
-            let mut best_key = (u8::MAX, u32::MAX, u32::MAX, u32::MAX, u64::MAX);
+            let mut best_key = (u8::MAX, u8::MAX, u32::MAX, u32::MAX, u64::MAX, u64::MAX);
             for (index, entry) in entries.iter().enumerate() {
                 if !is_available(entry) || entry.runtime.is_cooling_down(now_ms) {
                     continue;
@@ -1027,15 +1064,26 @@ impl MultiTokenManager {
             return None;
         }
 
+        let best_model_rank = available
+            .iter()
+            .filter_map(|e| credential_model_preference_rank(&e.credentials, model))
+            .min()?;
+        let preferred: Vec<_> = available
+            .into_iter()
+            .filter(|e| {
+                credential_model_preference_rank(&e.credentials, model) == Some(best_model_rank)
+            })
+            .collect();
+
         match mode {
             "round_robin" => {
                 let current_id = *self.current_id.lock();
-                let selected_index = available
+                let selected_index = preferred
                     .iter()
                     .position(|e| e.id == current_id)
                     .unwrap_or(0);
-                let entry = available[selected_index];
-                let next = available[(selected_index + 1) % available.len()];
+                let entry = preferred[selected_index];
+                let next = preferred[(selected_index + 1) % preferred.len()];
                 *self.current_id.lock() = next.id;
 
                 Some(SelectedCredential {
@@ -1046,10 +1094,7 @@ impl MultiTokenManager {
             }
             "balanced" => {
                 // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
-                let entry = available
-                    .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                let entry = preferred.iter().min_by_key(|e| (e.success_count, e.id))?;
 
                 Some(SelectedCredential {
                     id: entry.id,
@@ -1058,8 +1103,10 @@ impl MultiTokenManager {
                 })
             }
             _ => {
-                // priority 模式（默认）：选择优先级最高的
-                let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
+                // priority 模式（默认）：同一模型分组内选择成功次数最少的凭据。
+                let entry = preferred
+                    .iter()
+                    .min_by_key(|e| credential_request_rank(e, model))?;
                 Some(SelectedCredential {
                     id: entry.id,
                     credentials: entry.credentials.clone(),
@@ -1096,76 +1143,46 @@ impl MultiTokenManager {
 
             let selected = {
                 let mode = self.load_balancing_mode.lock().clone();
-                let rotates_on_each_request =
-                    mode == "balanced" || mode == "round_robin" || mode == "adaptive_round_robin";
+                // 每次请求都重新选择，避免 current_id 长期占用普通/高级模型路由。
+                let mut best = self.select_next_credential(model);
 
-                // balanced/round_robin/adaptive_round_robin 模式：每次请求都重新选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if rotates_on_each_request {
-                    None
+                // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
+                if best.is_none() {
+                    let mut entries = self.entries.lock();
+                    if entries.iter().any(|e| {
+                        e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
+                    }) {
+                        tracing::warn!(
+                            "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
+                        );
+                        for e in entries.iter_mut() {
+                            if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
+                                e.disabled = false;
+                                e.disabled_reason = None;
+                                e.failure_count = 0;
+                                e.immediate_failure_count = 0;
+                                e.runtime.clear_cooldown();
+                            }
+                        }
+                        drop(entries);
+                        best = self.select_next_credential(model);
+                    }
+                }
+
+                if let Some(selected) = best {
+                    if mode != "round_robin" && mode != "adaptive_round_robin" {
+                        // round_robin/adaptive_round_robin 在选择时已经推进 current_id。
+                        let mut current_id = self.current_id.lock();
+                        *current_id = selected.id;
+                    }
+                    selected
                 } else {
                     let entries = self.entries.lock();
-                    let current_id = *self.current_id.lock();
-                    let now_ms = now_epoch_ms();
-                    entries
-                        .iter()
-                        .find(|e| {
-                            e.id == current_id
-                                && !e.disabled
-                                && !e.runtime.is_cooling_down(now_ms)
-                                && credential_supports_requested_model(&e.credentials, model)
-                        })
-                        .map(|e| SelectedCredential {
-                            id: e.id,
-                            credentials: e.credentials.clone(),
-                            lease: CredentialLease::acquire(e.runtime.clone()),
-                        })
-                };
-
-                if let Some(hit) = current_hit {
-                    hit
-                } else {
-                    // 当前凭据不可用或轮换模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
-
-                    // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
-                    if best.is_none() {
-                        let mut entries = self.entries.lock();
-                        if entries.iter().any(|e| {
-                            e.disabled && e.disabled_reason == Some(DisabledReason::TooManyFailures)
-                        }) {
-                            tracing::warn!(
-                                "所有凭据均已被自动禁用，执行自愈：重置失败计数并重新启用（等价于重启）"
-                            );
-                            for e in entries.iter_mut() {
-                                if e.disabled_reason == Some(DisabledReason::TooManyFailures) {
-                                    e.disabled = false;
-                                    e.disabled_reason = None;
-                                    e.failure_count = 0;
-                                    e.immediate_failure_count = 0;
-                                    e.runtime.clear_cooldown();
-                                }
-                            }
-                            drop(entries);
-                            best = self.select_next_credential(model);
-                        }
-                    }
-
-                    if let Some(selected) = best {
-                        if mode != "round_robin" && mode != "adaptive_round_robin" {
-                            // round_robin 在选择时已经把 current_id 推进到下一张凭据。
-                            let mut current_id = self.current_id.lock();
-                            *current_id = selected.id;
-                        }
-                        selected
-                    } else {
-                        let entries = self.entries.lock();
-                        // 注意：必须在 bail! 之前计算 available_count，
-                        // 因为 available_count() 会尝试获取 entries 锁，
-                        // 而此时我们已经持有该锁，会导致死锁
-                        let available = entries.iter().filter(|e| !e.disabled).count();
-                        anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
-                    }
+                    // 注意：必须在 bail! 之前计算 available_count，
+                    // 因为 available_count() 会尝试获取 entries 锁，
+                    // 而此时我们已经持有该锁，会导致死锁
+                    let available = entries.iter().filter(|e| !e.disabled).count();
+                    anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                 }
             };
             let SelectedCredential {
@@ -1197,25 +1214,26 @@ impl MultiTokenManager {
         }
     }
 
-    /// 选择优先级最高的未禁用凭据作为当前凭据（内部方法）
+    /// 选择最适合普通模型的未禁用凭据作为当前凭据（内部方法）
     ///
-    /// 纯粹按优先级选择，不排除当前凭据，用于优先级变更后立即生效
-    fn select_highest_priority(&self) {
+    /// 普通模型优先 Free，同一分组内成功次数少优先。
+    fn select_best_available(&self) {
         let entries = self.entries.lock();
         let mut current_id = self.current_id.lock();
 
-        // 选择优先级最高的未禁用凭据（不排除当前凭据）
         if let Some(best) = entries
             .iter()
             .filter(|e| !e.disabled)
-            .min_by_key(|e| e.credentials.priority)
+            .filter_map(|e| credential_request_rank(e, None).map(|rank| (rank, e)))
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, entry)| entry)
         {
             if best.id != *current_id {
                 tracing::info!(
-                    "优先级变更后切换凭据: #{} -> #{}（优先级 {}）",
+                    "切换当前凭据: #{} -> #{}（成功次数 {}）",
                     *current_id,
                     best.id,
-                    best.credentials.priority
+                    best.success_count
                 );
                 *current_id = best.id;
             }
@@ -1498,7 +1516,7 @@ impl MultiTokenManager {
 
     /// 报告指定凭据 API 调用失败
     ///
-    /// 增加失败计数，达到阈值时禁用凭据并切换到优先级最高的可用凭据
+    /// 增加失败计数，达到阈值时禁用凭据并切换到最适合普通模型的可用凭据
     /// 返回是否还有可用凭据可以重试
     ///
     /// # Arguments
@@ -1533,17 +1551,18 @@ impl MultiTokenManager {
                 entry.disabled_reason = Some(DisabledReason::TooManyFailures);
                 tracing::error!("凭据 #{} 已连续失败 {} 次，已被禁用", id, failure_count);
 
-                // 切换到优先级最高的可用凭据
                 if let Some(next) = entries
                     .iter()
                     .filter(|e| !e.disabled)
-                    .min_by_key(|e| e.credentials.priority)
+                    .filter_map(|e| credential_request_rank(e, None).map(|rank| (rank, e)))
+                    .min_by_key(|(rank, _)| *rank)
+                    .map(|(_, entry)| entry)
                 {
                     *current_id = next.id;
                     tracing::info!(
-                        "已切换到凭据 #{}（优先级 {}）",
+                        "已切换到凭据 #{}（成功次数 {}）",
                         next.id,
-                        next.credentials.priority
+                        next.success_count
                     );
                 } else {
                     tracing::error!("所有凭据均已禁用！");
@@ -1584,17 +1603,18 @@ impl MultiTokenManager {
 
             tracing::error!("凭据 #{} 额度已用尽（MONTHLY_REQUEST_COUNT），已被禁用", id);
 
-            // 切换到优先级最高的可用凭据
             if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
+                .filter_map(|e| credential_request_rank(e, None).map(|rank| (rank, e)))
+                .min_by_key(|(rank, _)| *rank)
+                .map(|(_, entry)| entry)
             {
                 *current_id = next.id;
                 tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
+                    "已切换到凭据 #{}（成功次数 {}）",
                     next.id,
-                    next.credentials.priority
+                    next.success_count
                 );
                 true
             } else {
@@ -1650,13 +1670,15 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
+                .filter_map(|e| credential_request_rank(e, None).map(|rank| (rank, e)))
+                .min_by_key(|(rank, _)| *rank)
+                .map(|(_, entry)| entry)
             {
                 *current_id = next.id;
                 tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
+                    "已切换到凭据 #{}（成功次数 {}）",
                     next.id,
-                    next.credentials.priority
+                    next.success_count
                 );
                 true
             } else {
@@ -1753,13 +1775,15 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
+                .filter_map(|e| credential_request_rank(e, None).map(|rank| (rank, e)))
+                .min_by_key(|(rank, _)| *rank)
+                .map(|(_, entry)| entry)
             {
                 *current_id = next.id;
                 tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
+                    "已切换到凭据 #{}（成功次数 {}）",
                     next.id,
-                    next.credentials.priority
+                    next.success_count
                 );
                 true
             } else {
@@ -1801,13 +1825,15 @@ impl MultiTokenManager {
             if let Some(next) = entries
                 .iter()
                 .filter(|e| !e.disabled)
-                .min_by_key(|e| e.credentials.priority)
+                .filter_map(|e| credential_request_rank(e, None).map(|rank| (rank, e)))
+                .min_by_key(|(rank, _)| *rank)
+                .map(|(_, entry)| entry)
             {
                 *current_id = next.id;
                 tracing::info!(
-                    "已切换到凭据 #{}（优先级 {}）",
+                    "已切换到凭据 #{}（成功次数 {}）",
                     next.id,
-                    next.credentials.priority
+                    next.success_count
                 );
                 true
             } else {
@@ -1819,24 +1845,25 @@ impl MultiTokenManager {
         result
     }
 
-    /// 切换到优先级最高的可用凭据
+    /// 切换到最适合普通模型的可用凭据
     ///
     /// 返回是否成功切换
     pub fn switch_to_next(&self) -> bool {
         let entries = self.entries.lock();
         let mut current_id = self.current_id.lock();
 
-        // 选择优先级最高的未禁用凭据（排除当前凭据）
         if let Some(next) = entries
             .iter()
             .filter(|e| !e.disabled && e.id != *current_id)
-            .min_by_key(|e| e.credentials.priority)
+            .filter_map(|e| credential_request_rank(e, None).map(|rank| (rank, e)))
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, entry)| entry)
         {
             *current_id = next.id;
             tracing::info!(
-                "已切换到凭据 #{}（优先级 {}）",
+                "已切换到凭据 #{}（成功次数 {}）",
                 next.id,
-                next.credentials.priority
+                next.success_count
             );
             true
         } else {
@@ -1860,7 +1887,6 @@ impl MultiTokenManager {
                 .iter()
                 .map(|e| CredentialEntrySnapshot {
                     id: e.id,
-                    priority: e.credentials.priority,
                     disabled: e.disabled,
                     failure_count: e.failure_count,
                     auth_method: if e.credentials.is_api_key_credential() {
@@ -1897,6 +1923,7 @@ impl MultiTokenManager {
                         None
                     },
                     email: e.credentials.email.clone(),
+                    subscription_title: e.credentials.subscription_title.clone(),
                     success_count: e.success_count,
                     last_used_at: e.last_used_at.clone(),
                     has_proxy: e.credentials.proxy_url.is_some(),
@@ -1944,26 +1971,6 @@ impl MultiTokenManager {
                 entry.runtime.clear_cooldown();
             }
         }
-        // 持久化更改
-        self.persist_credentials()?;
-        Ok(())
-    }
-
-    /// 设置凭据优先级（Admin API）
-    ///
-    /// 修改优先级后会立即按新优先级重新选择当前凭据。
-    /// 即使持久化失败，内存中的优先级和当前凭据选择也会生效。
-    pub fn set_priority(&self, id: u64, priority: u32) -> anyhow::Result<()> {
-        {
-            let mut entries = self.entries.lock();
-            let entry = entries
-                .iter_mut()
-                .find(|e| e.id == id)
-                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
-            entry.credentials.priority = priority;
-        }
-        // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
-        self.select_highest_priority();
         // 持久化更改
         self.persist_credentials()?;
         Ok(())
@@ -2036,7 +2043,7 @@ impl MultiTokenManager {
             }
         };
 
-        self.select_highest_priority();
+        self.select_best_available();
 
         if result.reset_count > 0 {
             self.persist_credentials()?;
@@ -2243,7 +2250,6 @@ impl MultiTokenManager {
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
-        validated_cred.priority = new_cred.priority;
         validated_cred.auth_method = new_cred.auth_method.map(|m| {
             if m.eq_ignore_ascii_case("builder-id") || m.eq_ignore_ascii_case("iam") {
                 "idc".to_string()
@@ -2295,7 +2301,7 @@ impl MultiTokenManager {
     /// 1. 验证凭据存在
     /// 2. 验证凭据已禁用
     /// 3. 从 entries 移除
-    /// 4. 如果删除的是当前凭据，切换到优先级最高的可用凭据
+    /// 4. 如果删除的是当前凭据，切换到最适合普通模型的可用凭据
     /// 5. 如果删除后没有凭据，将 current_id 重置为 0
     /// 6. 持久化到文件
     ///
@@ -2327,9 +2333,8 @@ impl MultiTokenManager {
             was_current
         };
 
-        // 如果删除的是当前凭据，切换到优先级最高的可用凭据
         if was_current {
-            self.select_highest_priority();
+            self.select_best_available();
         }
 
         // 如果删除后没有任何凭据，将 current_id 重置为 0（与初始化行为保持一致）
@@ -2386,8 +2391,11 @@ impl MultiTokenManager {
             let next_current_id = entries
                 .iter()
                 .filter(|entry| !entry.disabled)
-                .min_by_key(|entry| entry.credentials.priority)
-                .map(|entry| entry.id);
+                .filter_map(|entry| {
+                    credential_request_rank(entry, None).map(|rank| (rank, entry.id))
+                })
+                .min_by_key(|(rank, _)| *rank)
+                .map(|(_, id)| id);
 
             (
                 ClearImmediateFailureDisabledResult {
@@ -2529,10 +2537,9 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    fn test_credential(id: u64, priority: u32) -> KiroCredentials {
+    fn test_credential(id: u64, _order_hint: u32) -> KiroCredentials {
         let mut credential = KiroCredentials::default();
         credential.id = Some(id);
-        credential.priority = priority;
         credential.access_token = Some(format!("test-access-token-{id}"));
         credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
         credential
@@ -2748,10 +2755,8 @@ mod tests {
     #[test]
     fn test_multi_token_manager_new() {
         let config = Config::default();
-        let mut cred1 = KiroCredentials::default();
-        cred1.priority = 0;
-        let mut cred2 = KiroCredentials::default();
-        cred2.priority = 1;
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
 
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
@@ -3069,6 +3074,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_multi_token_manager_priority_mode_routes_normal_model_to_free_before_pro() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut pro_cred = test_credential(1, 0);
+        pro_cred.subscription_title = Some("KIRO PRO".to_string());
+
+        let mut free_cred = test_credential(2, 1);
+        free_cred.subscription_title = Some("KIRO FREE".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![pro_cred, free_cred], None, None, false).unwrap();
+
+        let ctx = manager
+            .acquire_context(Some("claude-sonnet-4.5"))
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "test-access-token-2");
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_priority_mode_prefers_lower_success_count_within_free_tier() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut used_free_cred = test_credential(1, 0);
+        used_free_cred.subscription_title = Some("KIRO FREE".to_string());
+
+        let mut unused_free_cred = test_credential(2, 1);
+        unused_free_cred.subscription_title = Some("KIRO FREE".to_string());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![used_free_cred, unused_free_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.report_success(1);
+
+        let ctx = manager
+            .acquire_context(Some("claude-sonnet-4.5"))
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "test-access-token-2");
+    }
+
+    #[tokio::test]
+    async fn test_multi_token_manager_priority_mode_prefers_lower_success_count_within_pro_tier() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut used_pro_cred = test_credential(1, 0);
+        used_pro_cred.subscription_title = Some("KIRO PRO".to_string());
+
+        let mut unused_pro_cred = test_credential(2, 1);
+        unused_pro_cred.subscription_title = Some("KIRO PRO".to_string());
+
+        let manager = MultiTokenManager::new(
+            config,
+            vec![used_pro_cred, unused_pro_cred],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        manager.report_success(1);
+
+        let ctx = manager
+            .acquire_context(Some("claude-sonnet-4.6"))
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "test-access-token-2");
+    }
+
+    #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
         let mut cred1 = KiroCredentials::default();
@@ -3104,11 +3192,9 @@ mod tests {
         config.load_balancing_mode = "balanced".to_string();
 
         let mut bad_cred = KiroCredentials::default();
-        bad_cred.priority = 0;
         bad_cred.refresh_token = Some("bad".to_string());
 
         let mut good_cred = KiroCredentials::default();
-        good_cred.priority = 1;
         good_cred.access_token = Some("good-token".to_string());
         good_cred.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
 
@@ -3373,11 +3459,9 @@ mod tests {
         config.load_balancing_mode = mode.to_string();
 
         let mut cred1 = KiroCredentials::default();
-        cred1.priority = 0;
         cred1.kiro_api_key = Some("token-1".to_string());
 
         let mut cred2 = KiroCredentials::default();
-        cred2.priority = 1;
         cred2.kiro_api_key = Some("token-2".to_string());
 
         let manager =
@@ -3488,10 +3572,8 @@ mod tests {
     #[test]
     fn test_multi_token_manager_reset_and_enable_all_recovers_recoverable_credentials() {
         let config = Config::default();
-        let mut cred1 = KiroCredentials::default();
-        cred1.priority = 10;
-        let mut cred2 = KiroCredentials::default();
-        cred2.priority = 1;
+        let cred1 = KiroCredentials::default();
+        let cred2 = KiroCredentials::default();
 
         let manager =
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
@@ -3509,7 +3591,7 @@ mod tests {
 
         let snapshot = manager.snapshot();
         assert_eq!(snapshot.available, 2);
-        assert_eq!(snapshot.current_id, 2);
+        assert_eq!(snapshot.current_id, 1);
         assert!(snapshot.entries.iter().all(|entry| !entry.disabled));
         assert!(
             snapshot

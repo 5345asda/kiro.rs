@@ -419,6 +419,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
     }
 
     setQueryingInfo(false)
+    queryClient.invalidateQueries({ queryKey: ['credentials'] })
 
     if (failCount === 0) {
       toast.success(`查询完成：成功 ${successCount}/${ids.length}`)
@@ -578,12 +579,12 @@ export function Dashboard({ onLogout }: DashboardProps) {
     <div className="min-h-screen bg-background">
       {/* 顶部导航 */}
       <header className="sticky top-0 z-50 w-full border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-        <div className="container flex h-14 items-center justify-between px-4 md:px-8">
-          <div className="flex items-center gap-2">
+        <div className="container flex min-h-14 flex-wrap items-center justify-between gap-2 px-4 py-2 md:px-8">
+          <div className="flex min-w-0 items-center gap-2">
             <Server className="h-5 w-5" />
-            <span className="font-semibold">Kiro Admin</span>
+            <span className="truncate font-semibold">Kiro Admin</span>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
             <Button
               variant="outline"
               size="sm"
@@ -622,7 +623,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
       </header>
 
       {/* 主内容 */}
-      <main className="container mx-auto px-4 md:px-8 py-6">
+      <main className="container mx-auto min-w-0 px-4 py-6 md:px-8">
         {/* 统计卡片 */}
         <div className="grid gap-4 md:grid-cols-3 mb-6">
           <Card>
@@ -652,7 +653,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
               </CardTitle>
             </CardHeader>
             <CardContent>
-              <div className="text-2xl font-bold flex items-center gap-2">
+              <div className="flex min-w-0 flex-wrap items-center gap-2 text-2xl font-bold">
                 #{data?.currentId || '-'}
                 <Badge variant="success">活跃</Badge>
               </div>
@@ -662,11 +663,11 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
         {/* 凭据列表 */}
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-4">
+          <div className="flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
+            <div className="flex min-w-0 flex-wrap items-center gap-4">
               <h2 className="text-xl font-semibold">凭据管理</h2>
               {selectedIds.size > 0 && (
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <Badge variant="secondary">已选择 {selectedIds.size} 个</Badge>
                   <Button onClick={deselectAll} size="sm" variant="ghost">
                     取消选择
@@ -674,7 +675,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
                 </div>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex min-w-0 flex-wrap gap-2">
               {selectedIds.size > 0 && (
                 <>
                   <Button onClick={handleBatchVerify} size="sm" variant="outline">
@@ -770,7 +771,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
             </Card>
           ) : (
             <>
-              <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+              <div className="grid grid-cols-1 gap-4 xl:grid-cols-2 2xl:grid-cols-3">
                 {currentCredentials.map((credential) => (
                   <CredentialCard
                     key={credential.id}
@@ -786,7 +787,7 @@ export function Dashboard({ onLogout }: DashboardProps) {
 
               {/* 分页控件 */}
               {totalPages > 1 && (
-                <div className="flex justify-center items-center gap-4 mt-6">
+                <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
                   <Button
                     variant="outline"
                     size="sm"

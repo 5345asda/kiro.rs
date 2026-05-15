@@ -1,11 +1,10 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
-import { RefreshCw, ChevronUp, ChevronDown, Wallet, Trash2, Loader2 } from 'lucide-react'
+import { RefreshCw, Wallet, Trash2, Loader2 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Switch } from '@/components/ui/switch'
-import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   Dialog,
@@ -18,7 +17,6 @@ import {
 import type { CredentialStatusItem, BalanceResponse } from '@/types/api'
 import {
   useSetDisabled,
-  useSetPriority,
   useResetFailure,
   useDeleteCredential,
   useForceRefreshToken,
@@ -49,6 +47,10 @@ function formatLastUsed(lastUsedAt: string | null): string {
   return `${days} 天前`
 }
 
+function isPaidSubscription(subscriptionTitle: string | null | undefined): boolean {
+  return Boolean(subscriptionTitle && !subscriptionTitle.toUpperCase().includes('FREE'))
+}
+
 export function CredentialCard({
   credential,
   onViewBalance,
@@ -57,15 +59,14 @@ export function CredentialCard({
   balance,
   loadingBalance,
 }: CredentialCardProps) {
-  const [editingPriority, setEditingPriority] = useState(false)
-  const [priorityValue, setPriorityValue] = useState(String(credential.priority))
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
 
   const setDisabled = useSetDisabled()
-  const setPriority = useSetPriority()
   const resetFailure = useResetFailure()
   const deleteCredential = useDeleteCredential()
   const forceRefresh = useForceRefreshToken()
+  const subscriptionTitle = balance?.subscriptionTitle ?? credential.subscriptionTitle ?? null
+  const paidSubscription = isPaidSubscription(subscriptionTitle)
 
   const handleToggleDisabled = () => {
     setDisabled.mutate(
@@ -73,26 +74,6 @@ export function CredentialCard({
       {
         onSuccess: (res) => {
           toast.success(res.message)
-        },
-        onError: (err) => {
-          toast.error('操作失败: ' + (err as Error).message)
-        },
-      }
-    )
-  }
-
-  const handlePriorityChange = () => {
-    const newPriority = parseInt(priorityValue, 10)
-    if (isNaN(newPriority) || newPriority < 0) {
-      toast.error('优先级必须是非负整数')
-      return
-    }
-    setPriority.mutate(
-      { id: credential.id, priority: newPriority },
-      {
-        onSuccess: (res) => {
-          toast.success(res.message)
-          setEditingPriority(false)
         },
         onError: (err) => {
           toast.error('操作失败: ' + (err as Error).message)
@@ -143,40 +124,52 @@ export function CredentialCard({
 
   return (
     <>
-      <Card className={credential.isCurrent ? 'ring-2 ring-primary' : ''}>
+      <Card className={`${credential.isCurrent ? 'ring-2 ring-primary ' : ''}overflow-hidden`}>
         <CardHeader className="pb-2">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2">
+          <div className="flex min-w-0 items-start justify-between gap-3">
+            <div className="flex min-w-0 flex-1 items-start gap-2">
               <Checkbox
                 checked={selected}
                 onCheckedChange={onToggleSelect}
+                className="mt-1 shrink-0"
               />
-              <CardTitle className="text-lg flex items-center gap-2">
-                {credential.email || `凭据 #${credential.id}`}
-                {credential.isCurrent && (
-                  <Badge variant="success">当前</Badge>
-                )}
-                {credential.disabled && (
-                  <Badge variant="destructive">已禁用</Badge>
-                )}
-                {credential.disabled && credential.disabledReason && (
-                  <Badge variant="outline">{credential.disabledReason}</Badge>
-                )}
-                {credential.authMethod && (
-                  <Badge variant="secondary">
-                    {credential.authMethod === 'api_key' ? 'API Key' :
-                     credential.authMethod === 'idc' ? 'IdC' :
-                     credential.authMethod === 'social' ? 'Social' :
-                     credential.authMethod}
-                  </Badge>
-                )}
-                {credential.endpoint && (
-                  <Badge variant="outline">{credential.endpoint}</Badge>
-                )}
-              </CardTitle>
+              <div className="min-w-0 flex-1 space-y-2">
+                <CardTitle className="break-all text-base leading-snug">
+                  {credential.email || `凭据 #${credential.id}`}
+                </CardTitle>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {paidSubscription && (
+                    <Badge variant="success">高级模型</Badge>
+                  )}
+                  {credential.isCurrent && (
+                    <Badge variant="success">当前</Badge>
+                  )}
+                  {credential.disabled && (
+                    <Badge variant="destructive">已禁用</Badge>
+                  )}
+                  {credential.disabled && credential.disabledReason && (
+                    <Badge variant="outline" className="max-w-full break-all">
+                      {credential.disabledReason}
+                    </Badge>
+                  )}
+                  {credential.authMethod && (
+                    <Badge variant="secondary">
+                      {credential.authMethod === 'api_key' ? 'API Key' :
+                       credential.authMethod === 'idc' ? 'IdC' :
+                       credential.authMethod === 'social' ? 'Social' :
+                       credential.authMethod}
+                    </Badge>
+                  )}
+                  {credential.endpoint && (
+                    <Badge variant="outline" className="max-w-full break-all">
+                      {credential.endpoint}
+                    </Badge>
+                  )}
+                </div>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <span className="text-sm text-muted-foreground">启用</span>
+            <div className="flex shrink-0 items-center gap-2">
+              <span className="text-sm text-muted-foreground whitespace-nowrap">启用</span>
               <Switch
                 checked={!credential.disabled}
                 onCheckedChange={handleToggleDisabled}
@@ -187,49 +180,7 @@ export function CredentialCard({
         </CardHeader>
         <CardContent className="space-y-4">
           {/* 信息网格 */}
-          <div className="grid grid-cols-2 gap-4 text-sm">
-            <div>
-              <span className="text-muted-foreground">优先级：</span>
-              {editingPriority ? (
-                <div className="inline-flex items-center gap-1 ml-1">
-                  <Input
-                    type="number"
-                    value={priorityValue}
-                    onChange={(e) => setPriorityValue(e.target.value)}
-                    className="w-16 h-7 text-sm"
-                    min="0"
-                  />
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-7 w-7 p-0"
-                    onClick={handlePriorityChange}
-                    disabled={setPriority.isPending}
-                  >
-                    ✓
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-7 w-7 p-0"
-                    onClick={() => {
-                      setEditingPriority(false)
-                      setPriorityValue(String(credential.priority))
-                    }}
-                  >
-                    ✕
-                  </Button>
-                </div>
-              ) : (
-                <span
-                  className="font-medium cursor-pointer hover:underline ml-1"
-                  onClick={() => setEditingPriority(true)}
-                >
-                  {credential.priority}
-                  <span className="text-xs text-muted-foreground ml-1">(点击编辑)</span>
-                </span>
-              )}
-            </div>
+          <div className="grid grid-cols-1 gap-3 text-sm sm:grid-cols-2">
             <div>
               <span className="text-muted-foreground">失败次数：</span>
               <span className={credential.failureCount > 0 ? 'text-red-500 font-medium' : ''}>
@@ -247,24 +198,24 @@ export function CredentialCard({
               <span className="font-medium">
                 {loadingBalance ? (
                   <Loader2 className="inline w-3 h-3 animate-spin" />
-                ) : balance?.subscriptionTitle || '未知'}
+                ) : subscriptionTitle || '未知'}
               </span>
             </div>
             <div>
               <span className="text-muted-foreground">成功次数：</span>
               <span className="font-medium">{credential.successCount}</span>
             </div>
-            <div className="col-span-2">
+            <div className="sm:col-span-2">
               <span className="text-muted-foreground">最后调用：</span>
               <span className="font-medium">{formatLastUsed(credential.lastUsedAt)}</span>
             </div>
             {credential.maskedApiKey && (
-              <div className="col-span-2">
+              <div className="sm:col-span-2">
                 <span className="text-muted-foreground">API Key：</span>
-                <span className="font-mono font-medium">{credential.maskedApiKey}</span>
+                <span className="break-all font-mono font-medium">{credential.maskedApiKey}</span>
               </div>
             )}
-            <div className="col-span-2">
+            <div className="sm:col-span-2">
               <span className="text-muted-foreground">剩余用量：</span>
               {loadingBalance ? (
                 <span className="text-sm ml-1">
@@ -282,13 +233,13 @@ export function CredentialCard({
               )}
             </div>
             {credential.hasProxy && (
-              <div className="col-span-2">
+              <div className="sm:col-span-2">
                 <span className="text-muted-foreground">代理：</span>
-                <span className="font-medium">{credential.proxyUrl}</span>
+                <span className="break-all font-medium">{credential.proxyUrl}</span>
               </div>
             )}
             {credential.hasProfileArn && (
-              <div className="col-span-2">
+              <div className="sm:col-span-2">
                 <Badge variant="secondary">有 Profile ARN</Badge>
               </div>
             )}
@@ -314,42 +265,6 @@ export function CredentialCard({
             >
               <RefreshCw className={`h-4 w-4 mr-1 ${forceRefresh.isPending ? 'animate-spin' : ''}`} />
               刷新 Token
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                const newPriority = Math.max(0, credential.priority - 1)
-                setPriority.mutate(
-                  { id: credential.id, priority: newPriority },
-                  {
-                    onSuccess: (res) => toast.success(res.message),
-                    onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-                  }
-                )
-              }}
-              disabled={setPriority.isPending || credential.priority === 0}
-            >
-              <ChevronUp className="h-4 w-4 mr-1" />
-              提高优先级
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => {
-                const newPriority = credential.priority + 1
-                setPriority.mutate(
-                  { id: credential.id, priority: newPriority },
-                  {
-                    onSuccess: (res) => toast.success(res.message),
-                    onError: (err) => toast.error('操作失败: ' + (err as Error).message),
-                  }
-                )
-              }}
-              disabled={setPriority.isPending}
-            >
-              <ChevronDown className="h-4 w-4 mr-1" />
-              降低优先级
             </Button>
             <Button
               size="sm"
