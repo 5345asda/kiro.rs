@@ -3007,6 +3007,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_multi_token_manager_routes_paid_model_away_from_unknown_current_credential() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "priority".to_string();
+
+        let mut unknown_cred = test_credential(1, 0);
+        unknown_cred.subscription_title = None;
+
+        let mut pro_cred = test_credential(2, 1);
+        pro_cred.subscription_title = Some("KIRO PRO".to_string());
+
+        let manager =
+            MultiTokenManager::new(config, vec![unknown_cred, pro_cred], None, None, false)
+                .unwrap();
+
+        let ctx = manager
+            .acquire_context(Some("claude-sonnet-4.6"))
+            .await
+            .unwrap();
+
+        assert_eq!(ctx.id, 2);
+        assert_eq!(ctx.token, "test-access-token-2");
+    }
+
+    #[tokio::test]
     async fn test_multi_token_manager_routes_sonnet_4_6_to_pro_credential() {
         assert_paid_model_routes_to_pro_credential("claude-sonnet-4.6").await;
     }

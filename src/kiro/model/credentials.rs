@@ -256,8 +256,8 @@ impl KiroCredentials {
                 // 如果包含 FREE，则不支持付费订阅模型
                 !title_upper.contains("FREE")
             }
-            // 如果还没有获取订阅信息，暂时允许（首次使用时会获取）
-            None => true,
+            // 高级模型只允许明确识别为非 Free 的凭据，避免未知订阅的普通凭据占用请求。
+            None => false,
         }
     }
 
