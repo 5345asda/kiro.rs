@@ -710,7 +710,7 @@ pub struct MultiTokenManager {
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// `400/429` 这类需要切换但不禁用的状态在重试前的短冷却，避免立即回切。
-const RETRYABLE_STATUS_COOLDOWN: StdDuration = StdDuration::from_secs(30);
+const RETRYABLE_STATUS_COOLDOWN: StdDuration = StdDuration::from_secs(10);
 /// 单次获取调用上下文的最大内部尝试次数，避免大量坏凭据放大刷新/校验开销。
 const MAX_CONTEXT_ACQUIRE_ATTEMPTS: usize = 30;
 /// 统计数据持久化防抖间隔
@@ -2537,7 +2537,7 @@ mod tests {
     use super::*;
     use uuid::Uuid;
 
-    const EXPECTED_RETRYABLE_STATUS_COOLDOWN_SECS: u64 = 30;
+    const EXPECTED_RETRYABLE_STATUS_COOLDOWN_SECS: u64 = 10;
     const _: [(); EXPECTED_RETRYABLE_STATUS_COOLDOWN_SECS as usize] =
         [(); RETRYABLE_STATUS_COOLDOWN.as_secs() as usize];
 
