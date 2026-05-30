@@ -556,13 +556,14 @@ fn credential_request_rank(
     model: Option<&str>,
 ) -> Option<(u8, u64, u32, u32, u64)> {
     let model_rank = credential_model_preference_rank(&entry.credentials, model)?;
+    let success_rank = u64::MAX - entry.success_count;
     let failure_rank = entry
         .failure_count
         .saturating_add(entry.immediate_failure_count)
         .saturating_add(entry.refresh_failure_count);
     Some((
         model_rank,
-        entry.success_count,
+        success_rank,
         failure_rank,
         entry.runtime.in_flight.load(Ordering::Relaxed),
         entry.id,
@@ -1103,7 +1104,7 @@ impl MultiTokenManager {
                 })
             }
             _ => {
-                // priority 模式（默认）：同一模型分组内选择成功次数最少的凭据。
+                // priority 模式（默认）：同一模型分组内选择成功次数最多的凭据。
                 let entry = preferred
                     .iter()
                     .min_by_key(|e| credential_request_rank(e, model))?;
@@ -3101,7 +3102,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_priority_mode_prefers_lower_success_count_within_free_tier() {
+    async fn test_multi_token_manager_priority_mode_prefers_higher_success_count_within_free_tier()
+    {
         let mut config = Config::default();
         config.load_balancing_mode = "priority".to_string();
 
@@ -3126,12 +3128,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(ctx.id, 2);
-        assert_eq!(ctx.token, "test-access-token-2");
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "test-access-token-1");
     }
 
     #[tokio::test]
-    async fn test_multi_token_manager_priority_mode_prefers_lower_success_count_within_pro_tier() {
+    async fn test_multi_token_manager_priority_mode_prefers_higher_success_count_within_pro_tier() {
         let mut config = Config::default();
         config.load_balancing_mode = "priority".to_string();
 
@@ -3156,8 +3158,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(ctx.id, 2);
-        assert_eq!(ctx.token, "test-access-token-2");
+        assert_eq!(ctx.id, 1);
+        assert_eq!(ctx.token, "test-access-token-1");
     }
 
     #[tokio::test]

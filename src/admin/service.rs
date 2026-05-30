@@ -1,5 +1,6 @@
 //! Admin API 业务逻辑服务
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +27,70 @@ fn subscription_title_is_free(title: &str) -> bool {
         .as_bytes()
         .windows(4)
         .any(|window| window.eq_ignore_ascii_case(b"FREE"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use chrono::{Duration, Utc};
+
+    use crate::kiro::token_manager::MultiTokenManager;
+    use crate::model::config::Config;
+
+    use super::*;
+
+    fn test_credential(id: u64, subscription_title: &str, disabled: bool) -> KiroCredentials {
+        let mut credential = KiroCredentials::default();
+        credential.id = Some(id);
+        credential.access_token = Some(format!("test-access-token-{id}"));
+        credential.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        credential.subscription_title = Some(subscription_title.to_string());
+        credential.disabled = disabled;
+        credential
+    }
+
+    fn report_successes(manager: &MultiTokenManager, id: u64, count: u64) {
+        for _ in 0..count {
+            manager.report_success(id);
+        }
+    }
+
+    #[test]
+    fn test_get_all_credentials_sorts_by_paid_enabled_and_success_count_descending() {
+        let manager = Arc::new(
+            MultiTokenManager::new(
+                Config::default(),
+                vec![
+                    test_credential(1, "KIRO FREE", false),
+                    test_credential(2, "KIRO PRO", true),
+                    test_credential(3, "KIRO PRO", false),
+                    test_credential(4, "KIRO FREE", false),
+                    test_credential(5, "KIRO PRO", false),
+                ],
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+        );
+
+        report_successes(&manager, 1, 20);
+        report_successes(&manager, 2, 99);
+        report_successes(&manager, 3, 2);
+        report_successes(&manager, 4, 1);
+        report_successes(&manager, 5, 10);
+
+        let service = AdminService::new(manager, Vec::<String>::new());
+        let ids: Vec<u64> = service
+            .get_all_credentials()
+            .credentials
+            .into_iter()
+            .map(|credential| credential.id)
+            .collect();
+
+        assert_eq!(ids, vec![5, 3, 2, 1, 4]);
+    }
 }
 
 /// 缓存的余额条目（含时间戳）
@@ -111,7 +176,7 @@ impl AdminService {
                     }
                 })
                 .unwrap_or(1);
-            (paid_rank, c.disabled, c.success_count, c.id)
+            (paid_rank, c.disabled, Reverse(c.success_count), c.id)
         });
 
         CredentialsStatusResponse {
