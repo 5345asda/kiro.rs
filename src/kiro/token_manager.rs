@@ -2992,6 +2992,10 @@ mod tests {
             "claude-sonnet-4-6-thinking"
         )));
         assert!(model_requires_paid_subscription(Some("claude-opus-4.6")));
+        assert!(model_requires_paid_subscription(Some("claude-opus-4-7")));
+        assert!(model_requires_paid_subscription(Some(
+            "claude-opus-4-8-thinking"
+        )));
         assert!(!model_requires_paid_subscription(Some("claude-sonnet-4.5")));
         assert!(!model_requires_paid_subscription(Some("claude-haiku-4.5")));
         assert!(!model_requires_paid_subscription(None));
@@ -3053,6 +3057,8 @@ mod tests {
     #[tokio::test]
     async fn test_multi_token_manager_routes_opus_to_pro_credential() {
         assert_paid_model_routes_to_pro_credential("claude-opus-4.6").await;
+        assert_paid_model_routes_to_pro_credential("claude-opus-4-7").await;
+        assert_paid_model_routes_to_pro_credential("claude-opus-4-8-thinking").await;
     }
 
     #[tokio::test]

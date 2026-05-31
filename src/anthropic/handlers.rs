@@ -78,6 +78,42 @@ pub async fn get_models() -> impl IntoResponse {
 
     let models = vec![
         Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-opus-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 128_000,
+        },
+        Model {
+            id: "claude-opus-4-7".to_string(),
+            object: "model".to_string(),
+            created: 1776276000, // Apr 16, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64_000,
+        },
+        Model {
+            id: "claude-opus-4-7-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1776276000, // Apr 16, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64_000,
+        },
+        Model {
             id: "claude-opus-4-6".to_string(),
             object: "model".to_string(),
             created: 1770163200, // Feb 4, 2026
@@ -956,4 +992,41 @@ fn create_buffered_sse_stream(
         },
     )
     .flatten()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn test_get_models_includes_opus_4_7_and_4_8_variants() {
+        let response = get_models().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let data = payload["data"].as_array().unwrap();
+        let ids: Vec<&str> = data
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+
+        assert!(ids.contains(&"claude-opus-4-8"));
+        assert!(ids.contains(&"claude-opus-4-8-thinking"));
+        assert!(ids.contains(&"claude-opus-4-7"));
+        assert!(ids.contains(&"claude-opus-4-7-thinking"));
+
+        let opus_4_8 = data
+            .iter()
+            .find(|model| model["id"] == "claude-opus-4-8")
+            .unwrap();
+        assert_eq!(opus_4_8["max_tokens"], 128_000);
+
+        let opus_4_7 = data
+            .iter()
+            .find(|model| model["id"] == "claude-opus-4-7")
+            .unwrap();
+        assert_eq!(opus_4_7["max_tokens"], 64_000);
+    }
 }
